@@ -1,0 +1,3 @@
+# Veiss Mobile App
+
+This repository contains all of the code for the Veiss Mobile App. The app is still under progress. Stay tuned...
