@@ -5,14 +5,12 @@ import { DeviceEventEmitter } from 'react-native';
 
 /** Canonical UUIDs (uppercased) */
 const SERVICE_CAN = 'D1AD140F-BB29-4499-BC2B-3BC765CDA45D';
-const REPS_CAN    = '72657073-40D6-91C1-46F3-BE4B-39A18C097815';
-const SETS_CAN    = '73657473-DF83-4A36-BA2B-A01E85B53A03';
 
 /** Your device uses SIG-base UUIDs with 16-bit aliases */
 const REPS_FRAG = '0000AAAA'; // reps
 const SETS_FRAG = '0000AAAB'; // sets
 
-/** Command characteristic (provided) */
+/** Command characteristic */
 const CMD_CAN  = '0000CAAA-0000-1000-8000-00805F9B34FB';
 const CMD_FRAG = '0000CAAA';
 
@@ -20,7 +18,7 @@ const CMD_FRAG = '0000CAAA';
 const RAW_TOF_CAN  = '0000FEED-0000-1000-8000-00805F9B34FB';
 const RAW_TOF_FRAG = '0000FEED';
 
-/** === METRICS (BLEStringCharacteristic) — from your firmware === */
+/** === METRICS (BLEStringCharacteristic) — from firmware === */
 const UUIDS_METRICS = {
   CONCENTRIC: '0000AAAD-0000-1000-8000-00805F9B34FB',
   ECCENTRIC:  '0000AAAE-0000-1000-8000-00805F9B34FB',
@@ -28,7 +26,7 @@ const UUIDS_METRICS = {
   VELOCITY:   '0000BAAA-0000-1000-8000-00805F9B34FB',
 };
 
-/** Event name that Tracking.js and workout.js listen for */
+/** Event name that Tracking.js / others listen for */
 const BLE_EVT = 'bleCharacteristicValueChanged';
 
 /** Descriptors */
@@ -37,14 +35,20 @@ const CUD  = '00002901-0000-1000-8000-00805F9B34FB';
 const ENABLE_NOTIFY_B64  = 'AQA='; // 0x0001
 const DISABLE_NOTIFY_B64 = 'AA=='; // 0x0000
 
-const toUC = (s) => (s ? String(s).toUpperCase() : s);
-const strip = (s) => (s ? String(s).replace(/-/g, '').toUpperCase() : s);
+const toUC   = (s) => (s ? String(s).toUpperCase() : s);
+const strip  = (s) => (s ? String(s).replace(/-/g, '').toUpperCase() : s);
 
 /** Base64 helpers */
-function b64ToUtf8(b64) { try { return Buffer.from(b64, 'base64').toString('utf8'); } catch { return null; } }
-function parseText(txt) { if (txt == null) return null; return txt.replace(/\0/g, '').trim(); }
+function b64ToUtf8(b64) {
+  try { return Buffer.from(b64, 'base64').toString('utf8'); }
+  catch { return null; }
+}
+function parseText(txt) {
+  if (txt == null) return null;
+  return txt.replace(/\0/g, '').trim();
+}
 
-/** Coerce FLOAT or INT from payload (supports "92.3", "0.65", optional units like "0.65 m/s") */
+/** Coerce FLOAT or INT from payload (supports "92.3", "0.65 m/s", etc.) */
 function parseMaybeFloatFromValue(valueB64) {
   const asText = b64ToUtf8(valueB64);
   if (asText) {
@@ -57,12 +61,15 @@ function parseMaybeFloatFromValue(valueB64) {
       }
     }
   }
-  // fallback: try small integers via bytes
+  // fallback: try small integers via raw bytes
   const bytes = Uint8Array.from(Buffer.from(valueB64, 'base64'));
-  if (!bytes || bytes.length === 0) return null;
+  if (!bytes || !bytes.length) return null;
   const u8  = bytes[0];
   const u16 = bytes.length >= 2 ? (bytes[0] | (bytes[1] << 8)) : null;
-  const u32 = bytes.length >= 4 ? (bytes[0] | (bytes[1] << 8) | (bytes[2] << 16) | (bytes[3] << 24)) >>> 0 : null;
+  const u32 = bytes.length >= 4
+    ? (bytes[0] | (bytes[1] << 8) | (bytes[2] << 16) | (bytes[3] << 24)) >>> 0
+    : null;
+
   if (Number.isInteger(u8) && u8 <= 255) return u8;
   if (u16 != null && u16 <= 65535) return u16;
   if (u32 != null && u32 <= 1000000) return u32;
@@ -77,33 +84,42 @@ export default function useRepCounter(device) {
   const [lastError, setLastError] = useState(null);
   const [movementLive, setMovementLive] = useState(false); // true after first valid post-start reps
 
-  // Discovered UUIDs
+  // Resolved UUIDs
   const resolved = useRef({
     service: SERVICE_CAN,
     reps: null,
     sets: null,
     cmd: null,
-    metrics: { ...UUIDS_METRICS }, // will be validated against discovered chars
-    rawTof: null,                  // 0000FEED… (binary)
-    rawTofService: null,           // NEW: service that owns FEED
+    metrics: { ...UUIDS_METRICS },
+    rawTof: null,
+    rawTofService: null, // service that owns FEED
   });
+
   const subsRef = useRef([]);
   const pollRef = useRef(null);
 
   // Movement gating
   const awaitingMovement = useRef(false);   // ignore reps until we see a true post-start value
-  const prevRepsBeforeStart = useRef(null); // last known reps when starting the new exercise
-  const pollingPaused    = useRef(false);   // pause polling until movement goes live
+  const prevRepsBeforeStart = useRef(null); // last known reps before starting new exercise
+  const pollingPaused = useRef(false);      // pause read polling until movement goes live
 
-  /** ---------- cleanup ---------- */
-  const clearPoll = useCallback(() => { if (pollRef.current) { clearInterval(pollRef.current); pollRef.current = null; } }, []);
+  /** ---------- cleanup helpers ---------- */
+  const clearPoll = useCallback(() => {
+    if (pollRef.current) {
+      clearInterval(pollRef.current);
+      pollRef.current = null;
+    }
+  }, []);
+
   const stopMonitoring = useCallback(() => {
-    subsRef.current.forEach((s) => { try { s?.remove?.(); } catch {} });
+    subsRef.current.forEach((s) => {
+      try { s?.remove?.(); } catch {}
+    });
     subsRef.current = [];
     clearPoll();
   }, [clearPoll]);
 
-  /** ---------- helpers ---------- */
+  /** ---------- discovery helpers ---------- */
   const findExactInService = (chars, wantedUC) =>
     chars.find(c => toUC(c.uuid) === wantedUC)?.uuid || null;
 
@@ -142,7 +158,7 @@ export default function useRepCounter(device) {
     }
   }, [device]);
 
-  /** ---------- resolve UUIDs (now also validates metrics + FEED) ---------- */
+  /** ---------- resolve UUIDs (service + reps/sets/cmd/metrics/FEED) ---------- */
   const resolveUuids = useCallback(async () => {
     try {
       if (device?.discoverAllServicesAndCharacteristics) {
@@ -152,6 +168,7 @@ export default function useRepCounter(device) {
       const services = (await device.services?.()) || [];
       const ucServices = services.map(s => ({ ...s, uuidUC: toUC(s.uuid) }));
 
+      // main service
       const service =
         ucServices.find(s => s.uuidUC === SERVICE_CAN) ||
         ucServices.find(s => strip(s.uuidUC).endsWith(strip(SERVICE_CAN)));
@@ -161,7 +178,6 @@ export default function useRepCounter(device) {
 
       // Reps
       let repsId =
-        findExactInService(chars, REPS_CAN) ||
         findFragmentInService(chars, REPS_FRAG) ||
         null;
 
@@ -174,7 +190,6 @@ export default function useRepCounter(device) {
 
       // Sets
       let setsId =
-        findExactInService(chars, SETS_CAN) ||
         findFragmentInService(chars, SETS_FRAG) ||
         null;
 
@@ -195,7 +210,7 @@ export default function useRepCounter(device) {
         for (const c of chars) {
           if (!(c.isWritableWithResponse || c.isWritableWithoutResponse)) continue;
           const desc = await readCud(serviceId, c.uuid);
-          if (desc && /(cmd|command|reset)/i.test(desc)) { cmdId = c.uuid; break; }
+          if (desc && /(cmd|command|reset|start|stop)/i.test(desc)) { cmdId = c.uuid; break; }
         }
       }
       if (!cmdId) {
@@ -209,15 +224,14 @@ export default function useRepCounter(device) {
         (RAW_TOF_FRAG && findFragmentInService(chars, RAW_TOF_FRAG)) ||
         null;
       if (!rawTofId) {
-        // last-ditch by descriptor within the canonical service
         for (const c of chars) {
           const desc = await readCud(serviceId, c.uuid);
           if (desc && /(tof|distance|raw)/i.test(desc)) { rawTofId = c.uuid; break; }
         }
       }
 
-      // NEW: Search *all* services for FEED if still not found
-      let rawTofService = null; // remember which service owns FEED
+      // Search all services for FEED if still not found
+      let rawTofService = null;
       if (!rawTofId) {
         for (const s of ucServices) {
           if (!s?.uuid) continue;
@@ -243,7 +257,7 @@ export default function useRepCounter(device) {
       }
       if (rawTofId && !rawTofService) rawTofService = serviceId;
 
-      // Metrics (verify they exist; fall back to CUD name if needed)
+      // Metrics (verify they exist; fall back to CUD names if needed)
       const metrics = { ...UUIDS_METRICS };
       for (const key of Object.keys(metrics)) {
         const wanted = metrics[key];
@@ -252,7 +266,6 @@ export default function useRepCounter(device) {
           metrics[key] = exact;
           continue;
         }
-        // try by descriptor name
         for (const c of chars) {
           const desc = await readCud(serviceId, c.uuid);
           if (!desc) continue;
@@ -270,7 +283,7 @@ export default function useRepCounter(device) {
         cmd: cmdId,
         metrics,
         rawTof: rawTofId,
-        rawTofService, // NEW
+        rawTofService,
       };
 
       const ok = !!serviceId && (!!repsId || !!setsId);
@@ -283,20 +296,22 @@ export default function useRepCounter(device) {
     }
   }, [device, readCud, getCharsForService]);
 
-  /** ---------- CCCD ---------- */
+  /** ---------- CCCD helpers ---------- */
   const writeCCCD = useCallback(async (srv, char, b64) => {
     if (!char) return;
     try {
       if (device?.writeDescriptorForService) {
         await device.writeDescriptorForService(srv, char, CCCD, b64);
       }
-    } catch {}
+    } catch {
+      // ignore
+    }
   }, [device]);
 
   const enableNotify  = useCallback((srv, char) => writeCCCD(srv, char, ENABLE_NOTIFY_B64), [writeCCCD]);
   const disableNotify = useCallback((srv, char) => writeCCCD(srv, char, DISABLE_NOTIFY_B64), [writeCCCD]);
 
-  /** ---------- read/monitor ---------- */
+  /** ---------- safe reads ---------- */
   const safeRead = useCallback(async (srv, char, label) => {
     if (!char) return null;
     try {
@@ -311,7 +326,6 @@ export default function useRepCounter(device) {
         return txt || null;
       }
 
-      // for metrics
       const f = parseMaybeFloatFromValue(valB64);
       return f != null ? f : null;
     } catch (e) {
@@ -320,31 +334,36 @@ export default function useRepCounter(device) {
     }
   }, [device]);
 
-  // Emit to Tracking.js
+  /** ---------- emit metric to BLE bus consumers (Tracking.js) ---------- */
   const emitMetric = useCallback((uuid, valueFloat) => {
     if (!Number.isFinite(valueFloat)) return;
     try {
       DeviceEventEmitter.emit(BLE_EVT, {
         characteristicUUID: toUC(uuid),
-        value: valueFloat, // Tracking.js will parse if needed
+        value: valueFloat,
       });
-    } catch (e) {
-      // swallow
+    } catch {
+      // ignore
     }
   }, []);
 
+  /** ---------- generic monitor helper ---------- */
   const monitorGeneric = useCallback((srv, char, onValue) => {
     if (!char) return null;
     try {
-      const sub = device.monitorCharacteristicForService(srv, char, (error, characteristic) => {
-        if (error) {
-          setLastError(error?.message || String(error));
-          return;
+      const sub = device.monitorCharacteristicForService(
+        srv,
+        char,
+        (error, characteristic) => {
+          if (error) {
+            setLastError(error?.message || String(error));
+            return;
+          }
+          const valB64 = characteristic?.value || null;
+          if (!valB64) return;
+          onValue(valB64);
         }
-        const valB64 = characteristic?.value || null;
-        if (!valB64) return;
-        onValue(valB64);
-      });
+      );
       return sub;
     } catch (e) {
       setLastError(e?.message || String(e));
@@ -352,7 +371,7 @@ export default function useRepCounter(device) {
     }
   }, [device]);
 
-  // Specific monitor for reps/sets (stateful gating)
+  /** ---------- monitor reps/sets with gating ---------- */
   const monitorRepSet = useCallback((srv, char, label) => {
     return monitorGeneric(srv, char, (valB64) => {
       let finalVal = parseMaybeFloatFromValue(valB64);
@@ -362,20 +381,19 @@ export default function useRepCounter(device) {
       }
       if (finalVal == null) return;
 
-      // ——— HARD GATE for reps on exercise start ———
+      // Hard gate for reps on exercise start
       if (label === 'reps' && awaitingMovement.current) {
         const prev = prevRepsBeforeStart.current;
         const n = typeof finalVal === 'number' ? finalVal : parseFloat(finalVal);
         if (!Number.isFinite(n)) return;
 
-        // Accept only true post-start values:
         const accept =
           (prev != null && (n === 0 || n === 1 || n < prev)) ||
           (prev == null && (n === 0 || n === 1));
 
         if (!accept) return;
 
-        // First valid post-start -> unlock stream
+        // first valid post-start value unlocks stream
         awaitingMovement.current = false;
         setMovementLive(true);
         if (pollingPaused.current) pollingPaused.current = false;
@@ -386,7 +404,7 @@ export default function useRepCounter(device) {
     });
   }, [monitorGeneric]);
 
-  // Monitor for metrics → emit to Tracking.js
+  /** ---------- monitor metrics ---------- */
   const monitorMetric = useCallback((srv, uuid) => {
     return monitorGeneric(srv, uuid, (valB64) => {
       const f = parseMaybeFloatFromValue(valB64);
@@ -395,7 +413,7 @@ export default function useRepCounter(device) {
     });
   }, [emitMetric, monitorGeneric]);
 
-  // Pass-through monitor for Raw ToF: emit base64 directly on the BLE bus
+  /** ---------- monitor raw ToF → emit base64 ---------- */
   const monitorRawTof = useCallback((srv, uuid) => {
     return monitorGeneric(srv, uuid, (valB64) => {
       try {
@@ -403,78 +421,95 @@ export default function useRepCounter(device) {
           characteristicUUID: toUC(uuid),
           value: valB64, // base64 (binary)
         });
-      } catch {}
+      } catch {
+        // ignore
+      }
     });
   }, [monitorGeneric]);
 
-  /** ---------- monitoring orchestration ---------- */
-  const startMonitoring = useCallback(async ({ seedInitial = true } = {}) => {
-    if (!device?.id) return;
+  /** ---------- orchestrate monitoring ---------- */
+  const startMonitoring = useCallback(
+    async ({ seedInitial = true } = {}) => {
+      if (!device?.id) return;
 
-    stopMonitoring();
+      stopMonitoring();
+      await resolveUuids();
 
-    await resolveUuids();
-    const { service, reps, sets, metrics, rawTof, rawTofService } = resolved.current;
+      const { service, reps, sets, metrics, rawTof, rawTofService } = resolved.current;
+      if (!reps && !sets && !metrics && !rawTof) return;
 
-    if (!reps && !sets && !metrics && !rawTof) return;
+      // brief delay lets BLE settle
+      await new Promise((r) => setTimeout(r, 80));
 
-    await new Promise((r) => setTimeout(r, 80));
+      // enable notify on all relevant chars
+      if (reps) await enableNotify(service, reps);
+      if (sets) await enableNotify(service, sets);
+      for (const k of Object.keys(metrics)) {
+        const mUuid = metrics[k];
+        if (mUuid) await enableNotify(service, mUuid);
+      }
+      if (rawTof) await enableNotify(rawTofService || service, rawTof);
 
-    // enable notify on everything we care about
-    if (reps) await enableNotify(service, reps);
-    if (sets) await enableNotify(service, sets);
-    for (const k of Object.keys(metrics)) {
-      const mUuid = metrics[k];
-      if (mUuid) await enableNotify(service, mUuid);
-    }
-    if (rawTof) await enableNotify(rawTofService || service, rawTof); // NEW: FEED may be on different service
+      // Initial seeding (skip when starting a new exercise)
+      if (seedInitial) {
+        const [initialReps, initialSet] = await Promise.all([
+          reps ? safeRead(service, reps, 'reps') : Promise.resolve(null),
+          sets ? safeRead(service, sets, 'set') : Promise.resolve(null),
+        ]);
+        setValues({ reps: initialReps, set: initialSet });
+        if (initialReps != null || initialSet != null) setIsReady(true);
 
-    // Optional seed reads — SKIP when starting a new exercise to avoid stale values
-    if (seedInitial) {
-      const [initialReps, initialSet] = await Promise.all([
-        reps ? safeRead(service, reps, 'reps') : Promise.resolve(null),
-        sets ? safeRead(service, sets, 'set')  : Promise.resolve(null),
-      ]);
-      setValues({ reps: initialReps, set: initialSet });
-      if (initialReps != null || initialSet != null) setIsReady(true);
+        // Metrics seed
+        await Promise.all(
+          Object.values(metrics).map(async (uuid) => {
+            if (!uuid) return;
+            const f = await safeRead(service, uuid, 'metric');
+            if (f != null) emitMetric(uuid, f);
+          })
+        );
+      }
 
-      // Seed reads for metrics (emit once so UI can flash immediately)
-      await Promise.all(
-        Object.values(metrics).map(async (uuid) => {
-          if (!uuid) return;
-          const f = await safeRead(service, uuid, 'metric');
-          if (f != null) emitMetric(uuid, f);
-        })
+      // Start monitors
+      const sR = reps ? monitorRepSet(service, reps, 'reps') : null;
+      const sS = sets ? monitorRepSet(service, sets, 'set') : null;
+      const metricSubs = Object.values(metrics).map((uuid) =>
+        uuid ? monitorMetric(service, uuid) : null
       );
-    }
+      const sTOF = rawTof
+        ? monitorRawTof(rawTofService || service, rawTof)
+        : null;
 
-    // Start monitors
-    const sR = reps ? monitorRepSet(service, reps, 'reps') : null;
-    const sS = sets ? monitorRepSet(service, sets, 'set') : null;
+      subsRef.current = [sR, sS, sTOF, ...metricSubs].filter(Boolean);
 
-    const metricSubs = Object.values(metrics).map((uuid) =>
-      uuid ? monitorMetric(service, uuid) : null
-    );
-    const sTOF = rawTof ? monitorRawTof(rawTofService || service, rawTof) : null; // NEW
-
-    subsRef.current = [sR, sS, sTOF, ...metricSubs].filter(Boolean);
-
-    // Light polling for robustness (reps/set only)
-    clearPoll();
-    pollRef.current = setInterval(async () => {
-      if (pollingPaused.current) return; // pause until movement confirmed
-      const { service: srv, reps: rChar, sets: sChar } = resolved.current;
-      const [r, s] = await Promise.all([
-        rChar ? safeRead(srv, rChar, 'reps') : Promise.resolve(null),
-        sChar ? safeRead(srv, sChar, 'set')  : Promise.resolve(null),
-      ]);
-      setValues((prevVals) => ({
-        reps: r ?? prevVals.reps,
-        set:  s ?? prevVals.set,
-      }));
-      if (r != null || s != null) setIsReady(true);
-    }, 1500);
-  }, [device, resolveUuids, enableNotify, monitorRepSet, monitorMetric, monitorRawTof, safeRead, stopMonitoring, clearPoll, emitMetric]);
+      // Light polling for robustness (reps/set only)
+      clearPoll();
+      pollRef.current = setInterval(async () => {
+        if (pollingPaused.current) return;
+        const { service: srv, reps: rChar, sets: sChar } = resolved.current;
+        const [r, s] = await Promise.all([
+          rChar ? safeRead(srv, rChar, 'reps') : Promise.resolve(null),
+          sChar ? safeRead(srv, sChar, 'set')  : Promise.resolve(null),
+        ]);
+        setValues((prevVals) => ({
+          reps: r ?? prevVals.reps,
+          set:  s ?? prevVals.set,
+        }));
+        if (r != null || s != null) setIsReady(true);
+      }, 1500);
+    },
+    [
+      device,
+      resolveUuids,
+      enableNotify,
+      monitorRepSet,
+      monitorMetric,
+      monitorRawTof,
+      safeRead,
+      stopMonitoring,
+      clearPoll,
+      emitMetric,
+    ]
+  );
 
   useEffect(() => stopMonitoring, [stopMonitoring]);
 
@@ -500,27 +535,28 @@ export default function useRepCounter(device) {
     }
   }, [device, resolveUuids]);
 
-  /** ---------- Atomic, movement-gated exercise start ---------- */
-  // disable CCCD → stop local monitors → send "start_workout" → resubscribe (no seed) → gate reps until true post-start
+  /** ---------- Exercise start: send "start_workout" and fully gate reps ---------- */
   const exerciseStartFlow = useCallback(async () => {
     await resolveUuids();
     const { service, reps, sets, rawTof, rawTofService } = resolved.current;
 
-    // capture previous reps as numeric (if available)
-    const prevNum = typeof values.reps === 'number' ? values.reps : parseFloat(values.reps);
+    // Capture previous reps as numeric
+    const prevNum =
+      typeof values.reps === 'number'
+        ? values.reps
+        : parseFloat(values.reps);
     prevRepsBeforeStart.current = Number.isFinite(prevNum) ? prevNum : null;
 
-    // stop listeners & clear UI
+    // stop current listeners & clear UI
     stopMonitoring();
     setValues({ reps: null, set: null });
     setMovementLive(false);
 
-    // disable notifies to avoid cached notify bursts
+    // disable notifications to avoid cached bursts
     if (service) {
       if (reps) await disableNotify(service, reps);
       if (sets) await disableNotify(service, sets);
-      if (rawTof) await disableNotify(rawTofService || service, rawTof); // NEW
-      // metrics notify will be re-enabled on startMonitoring()
+      if (rawTof) await disableNotify(rawTofService || service, rawTof);
       const { metrics } = resolved.current;
       for (const k of Object.keys(metrics)) {
         const mUuid = metrics[k];
@@ -528,42 +564,59 @@ export default function useRepCounter(device) {
       }
     }
 
-    // tell device to START (firmware should begin new set/rep session)
+    // Tell device to START workout/session
     await writeText('start_workout');
 
-    // prepare strict gating
+    // Reps gating
     awaitingMovement.current = true;
-    pollingPaused.current  = true;
+    pollingPaused.current = true;
 
-    // resubscribe WITHOUT initial reads; we won't accept reps until start condition is satisfied
+    // Resubscribe WITHOUT seeding initial values
     await startMonitoring({ seedInitial: false });
-  }, [resolveUuids, stopMonitoring, disableNotify, writeText, startMonitoring, values.reps]); // NOTE: resolveUids is a typo fix below
+  }, [
+    resolveUuids,
+    stopMonitoring,
+    disableNotify,
+    writeText,
+    startMonitoring,
+    values.reps,
+  ]);
 
   /** ---------- Exercise end: send "end_workout" ---------- */
   const exerciseEndFlow = useCallback(async () => {
     await resolveUuids();
     await writeText('end_workout');
-    // optional: keep monitors running or let callers stopMonitoring()
+    // You can keep monitors running for live view, or
+    // caller can explicitly stopMonitoring() after this.
   }, [resolveUuids, writeText]);
 
-  // Bridge: UI start event (existing)
+  /** ---------- Bridge legacy "ble:exercise:start" events ---------- */
   useEffect(() => {
-    const subExerciseStart = DeviceEventEmitter.addListener('ble:exercise:start', () => {
-      exerciseStartFlow();
-    });
+    const subExerciseStart = DeviceEventEmitter.addListener(
+      'ble:exercise:start',
+      () => {
+        exerciseStartFlow();
+      }
+    );
     return () => {
       try { subExerciseStart.remove(); } catch {}
     };
   }, [exerciseStartFlow]);
 
-  // NEW: Bridge workout:* events used by workout.js
+  /** ---------- Bridge workout:* events used by workout.js ---------- */
   useEffect(() => {
-    const subStart = DeviceEventEmitter.addListener('workout:start_stream', () => {
-      exerciseStartFlow();
-    });
-    const subStop  = DeviceEventEmitter.addListener('workout:stop_stream', () => {
-      exerciseEndFlow();
-    });
+    const subStart = DeviceEventEmitter.addListener(
+      'workout:start_stream',
+      () => {
+        exerciseStartFlow();
+      }
+    );
+    const subStop = DeviceEventEmitter.addListener(
+      'workout:stop_stream',
+      () => {
+        exerciseEndFlow();
+      }
+    );
     return () => {
       try { subStart.remove(); } catch {}
       try { subStop.remove(); } catch {}
@@ -571,10 +624,15 @@ export default function useRepCounter(device) {
   }, [exerciseStartFlow, exerciseEndFlow]);
 
   return {
-    values, isReady, isRepCounter, lastError, movementLive,
+    values,
+    isReady,
+    isRepCounter,
+    lastError,
+    movementLive,
     beginExercise: exerciseStartFlow,
-    finishExercise: exerciseEndFlow,     // call this on "Finish Exercise"
-    startMonitoring, stopMonitoring,
+    finishExercise: exerciseEndFlow, // call on "Finish Exercise"
+    startMonitoring,
+    stopMonitoring,
     writeText,
   };
 }

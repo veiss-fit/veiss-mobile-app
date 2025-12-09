@@ -19,6 +19,7 @@ import { getWorkoutByDate, saveWorkout, setWriteGate, applyValidatedCounts } fro
 import useRepCounter from '../hooks/useRepCounter';
 import { useBLE } from '../contexts/BLEContext';
 import { runVeissFromRows } from '../lib/veiss';
+import { RAW_TOF_UUID, TOF_MAX_SAMPLES, parseSycamoreFrame } from '../lib/tof';
 
 /* ------------------ small in-file helpers ------------------ */
 const toNumOrNull = (v) => {
@@ -84,30 +85,6 @@ const buildValidatedMetricsFromCorrection = (validatedReps = [], fallback = []) 
       Eccentric: ecc ?? null,
     };
   });
-
-/* ------------- ToF parsing (uint16 LE distances) ------------- */
-const RAW_TOF_UUID = '0000FEED-0000-1000-8000-00805F9B34FB';
-const TOF_MAX_SAMPLES = 120;
-const parseTofPacket = (b64) => {
-  if (typeof b64 !== 'string' || !b64.length) return null;
-  let bytes;
-  try { bytes = Uint8Array.from(Buffer.from(b64, 'base64')); } catch { return null; }
-  if (!bytes || bytes.length < 4) return null;
-  const frameId = (bytes[0] | (bytes[1] << 8)) >>> 0;
-  let numZones = bytes[2] >>> 0;
-  const exp = 4 + numZones * 2;
-  let distances = [];
-  if (bytes.length < exp) {
-    const inf = Math.floor((bytes.length - 4) / 2);
-    if (inf <= 0) return null;
-    numZones = inf;
-  }
-  for (let i = 0; i < numZones; i++) {
-    const lo = bytes[4 + i * 2], hi = bytes[4 + i * 2 + 1];
-    distances.push((lo | (hi << 8)) >>> 0);
-  }
-  return { frameId, numZones, distances };
-};
 
 /* ------------------- small persistence helpers ------------------- */
 const persistTodayIfNeeded = async () => {
@@ -332,34 +309,74 @@ export default function Workout() {
   }, [recordSet, activeExercise, resetTofForNextSet]);
 
   // subscribe to Raw ToF → chart + buffer rows
+  // subscribe to Raw ToF → chart + buffer rows (Sycamore format)
   useEffect(() => {
     const onStart = DeviceEventEmitter.addListener('workout:start_stream', (evt) => {
       graphActiveRef.current = true;
-      setTofSeries([]); setTofMeta({ frameId: null, zones: null });
+      setTofSeries([]);
+      setTofMeta({ frameId: null, zones: null });
       currentTofRowsRef.current = [];
       currentExerciseRef.current = evt?.exercise || null;
     });
+
     const onStop = DeviceEventEmitter.addListener('workout:stop_stream', () => {
       graphActiveRef.current = false;
-      setTofSeries([]); setTofMeta({ frameId: null, zones: null });
+      setTofSeries([]);
+      setTofMeta({ frameId: null, zones: null });
     });
-    const sub = DeviceEventEmitter.addListener('bleCharacteristicValueChanged', (payload) => {
-      try {
-        const uuid = String(payload?.characteristicUUID || '').toUpperCase();
-        if (uuid !== RAW_TOF_UUID || !graphActiveRef.current) return;
-        const pkt = parseTofPacket(payload?.value); if (!pkt) return;
-        const { frameId, numZones, distances } = pkt; if (!distances?.length) return;
 
-        const avg = distances.reduce((a, b) => a + b, 0) / distances.length;
-        setTofMeta({ frameId, zones: numZones });
-        setTofSeries((prev) => (prev.length >= TOF_MAX_SAMPLES ? [...prev.slice(1), avg] : [...prev, avg]));
+    const sub = DeviceEventEmitter.addListener(
+      'bleCharacteristicValueChanged',
+      (payload) => {
+        try {
+          const uuid = String(payload?.characteristicUUID || '').toUpperCase();
+          if (uuid !== RAW_TOF_UUID || !graphActiveRef.current) return;
 
-        const row = { session_id: sessionIdRef.current, timestamp_ms: Date.now() };
-        for (let i = 0; i < numZones; i++) row[`z${i}`] = distances[i];
-        currentTofRowsRef.current.push(row);
-      } catch {}
-    });
-    return () => { try { sub.remove(); } catch {} try { onStart.remove(); } catch {} try { onStop.remove(); } catch {} };
+          // ✅ NEW: decode Sycamore packet (timestamp + frameId + numZones + distances)
+          const pkt = parseSycamoreFrame(payload?.value);
+          if (!pkt) return;
+
+          const { timestamp_ms, frameId, numZones, distances } = pkt;
+          if (!distances?.length || !Number.isFinite(numZones)) return;
+
+          // mini-graph: average distance across zones
+          const avg =
+            distances.reduce((a, b) => a + b, 0) / distances.length;
+
+          setTofMeta({ frameId, zones: numZones });
+          setTofSeries((prev) =>
+            prev.length >= TOF_MAX_SAMPLES
+              ? [...prev.slice(1), avg]
+              : [...prev, avg]
+          );
+
+          // buffer row for rep engine — use DEVICE timestamp_ms
+          const row = {
+            session_id: sessionIdRef.current,
+            timestamp_ms, // ✅ real device time
+          };
+          for (let i = 0; i < numZones; i++) {
+            row[`z${i}`] = distances[i];
+          }
+          currentTofRowsRef.current.push(row);
+        } catch {
+          // ignore
+        }
+      }
+    );
+
+    return () => {
+      try { sub.remove(); } catch {}
+      try { onStart.remove(); } catch {}
+      try { onStop.remove(); } catch {}
+    };
+  }, []);
+
+  useEffect(() => {
+    return () => {
+      console.log("[Workout] Screen unmounted → sending stop_stream failsafe");
+      DeviceEventEmitter.emit("workout:stop_stream");
+    };
   }, []);
 
   // add/delete exercise (session UI)
